@@ -1,0 +1,54 @@
+# Virtual environments
+.venv/
+venv/
+env/
+.venv-*/
+
+# Python and build caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+.coverage
+htmlcov/
+
+# Raw recordings, generated artifacts and model weights
+data/raw/
+outputs/
+runs/
+*.log
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.m4v
+*.mpeg
+*.mpg
+*.wmv
+*.pt
+*.pth
+*.onnx
+*.tflite
+*.safetensors
+models/weights/
+
+# Local secrets (sample configuration stays trackable)
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Downloaded M2 models and local library settings
+models/
+Ultralytics/

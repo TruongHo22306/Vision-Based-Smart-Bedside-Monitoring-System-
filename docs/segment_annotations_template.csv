@@ -1,0 +1,1 @@
+segment_id,video_id,start_sec,end_sec,start_frame_index,end_frame_index_exclusive,segment_kind,activity_label,transition_from,transition_to,label_certainty,candidate_labels,uncertainty_reason,full_body,occlusion,affected_regions,event_annotation_status,event_id,annotator_id,annotated_at_utc,reviewer_id,reviewed_at_utc,annotation_status,notes

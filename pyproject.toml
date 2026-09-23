@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "patient-monitoring"
+version = "0.1.0"
+description = "Patient monitoring: environment and video timeline inspection"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["av==16.1.0", "Pillow==12.1.1", "ultralytics==8.4.152", "torch==2.9.1", "torchvision==0.24.1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,1 @@
+video_id,subject_id,session_id,recording_group_id,original_filename,relative_path,sha256,source_description,recorded_at_utc,consent_status,recording_kind,planned_activity,duration_sec,width,height,decoded_frame_count,first_pts,time_base,timestamp_status,camera_notes,scene_notes,full_body_notes,occlusion_notes,dataset_role,annotation_status,qc_status,notes
