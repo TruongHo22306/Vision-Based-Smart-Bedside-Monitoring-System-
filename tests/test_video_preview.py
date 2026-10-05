@@ -89,6 +89,21 @@ class PreviewTests(unittest.TestCase):
             preview_video(self.source, self.output)
         self.assertEqual(report.read_bytes(), b'keep M1.1')
 
+    def test_twelve_samples_keep_time_distribution_and_endpoints(self):
+        with patch('patient_monitoring.video_preview.inspect_video', side_effect=self.make_audit(list(range(0, 2300, 100)))), \
+                patch('patient_monitoring.video_preview.export_images', return_value=12):
+            result = preview_video(self.source, self.output, 12)
+        self.assertEqual(result['preview_status'], 'complete')
+        with (self.output / 'samples.csv').open(newline='') as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual([int(row['frame_index']) for row in rows], list(range(0, 23, 2)))
+        self.assertEqual([float(row['actual_time_seconds']) for row in rows], list(range(0, 23, 2)))
+
+    def test_thirteen_samples_rejected_before_output_creation(self):
+        with self.assertRaises(InspectionError):
+            preview_video(self.source, self.output, 13)
+        self.assertFalse(self.output.exists())
+
     def test_no_valid_times_fails_clearly(self):
         with patch('patient_monitoring.video_preview.inspect_video', side_effect=self.make_audit([None, None])):
             result = preview_video(self.source, self.output)

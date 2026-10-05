@@ -42,7 +42,7 @@ def sha256_file(path):
 
 
 def read_samples(input_dir):
-    """Validate up to eight CSV rows; never discover images by directory scanning."""
+    """Validate up to twelve CSV rows; never discover images by directory scanning."""
     records = []
     seen = {}
     with (input_dir / "samples.csv").open(encoding="utf-8-sig", newline="") as file:
@@ -51,8 +51,8 @@ def read_samples(input_dir):
         if not required.issubset(reader.fieldnames or []):
             raise InspectionError("samples.csv lacks frame_index/actual_time_seconds/image_filename.")
         for csv_index, row in enumerate(reader):
-            if csv_index >= 8:
-                raise InspectionError("This smoke test accepts up to 8 preview CSV rows.")
+            if csv_index >= 12:
+                raise InspectionError("This smoke test accepts up to 12 preview CSV rows.")
             frame_index = int(row["frame_index"])
             timestamp = float(row["actual_time_seconds"])
             path = (input_dir / row["image_filename"]).resolve()

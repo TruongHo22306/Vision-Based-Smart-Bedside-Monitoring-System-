@@ -99,6 +99,22 @@ class PoseCommandTests(unittest.TestCase):
         with self.assertRaises(InspectionError):
             read_samples(self.input)
 
+    def test_twelve_csv_samples_preserve_mapping_and_reject_thirteenth(self):
+        with (self.input / 'samples.csv').open('w', newline='') as handle:
+            writer = csv.writer(handle)
+            writer.writerow(['frame_index', 'actual_time_seconds', 'image_filename'])
+            for index in range(12):
+                name = f'frame_{index}.png'
+                (self.input / name).write_bytes((self.input / 'referenced.png').read_bytes())
+                writer.writerow([index * 3, str(index / 2), name])
+        records = read_samples(self.input)
+        self.assertEqual([r['frame_index'] for r in records], list(range(0, 36, 3)))
+        self.assertEqual([r['actual_time_seconds'] for r in records], [i / 2 for i in range(12)])
+        with (self.input / 'samples.csv').open('a', newline='') as handle:
+            csv.writer(handle).writerow([99, '9.9', 'referenced.png'])
+        with self.assertRaises(InspectionError):
+            read_samples(self.input)
+
     def test_zero_detection_run_still_writes_image_record_and_sheet(self):
         # Ultralytics 8.4.152 accepts half=False but does not expose that key
         # again on predictor.args. Reporting must not turn successful inference

@@ -35,7 +35,7 @@ def main() -> None:
     preview.add_argument("path", type=Path)
     preview.add_argument("--output-dir", type=Path, required=True,
                          help="New directory for preview images and timing summary.")
-    preview.add_argument("--samples", type=int, default=8, choices=range(2, 9))
+    preview.add_argument("--samples", type=int, default=8, choices=range(2, 13))
     pose = commands.add_parser("pose-preview", help="Run the CPU YOLO11n pose smoke test.")
     pose.add_argument("input_dir", type=Path)
     pose.add_argument("--output-dir", type=Path, required=True)

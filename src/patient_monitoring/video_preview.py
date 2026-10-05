@@ -140,8 +140,8 @@ def export_images(source, output_dir, mappings, expected):
 
 def preview_video(source: Path, output_dir: Path, samples: int = 8) -> dict:
     """Audit to temporary disk, sample timestamps, then export to a new directory."""
-    if not 2 <= samples <= 8:
-        raise InspectionError("--samples must be between 2 and 8 to include both endpoints.")
+    if not 2 <= samples <= 12:
+        raise InspectionError("--samples must be between 2 and 12 to include both endpoints.")
     source = source.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
     if not source.is_file() or source.stat().st_size == 0:
