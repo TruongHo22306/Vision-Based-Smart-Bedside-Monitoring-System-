@@ -45,6 +45,17 @@ def main() -> None:
     extract.add_argument("path", type=Path)
     extract.add_argument("--output-dir", type=Path, required=True,
                          help="New directory for poses.jsonl, summary.json and run_info.json.")
+    features = commands.add_parser("extract-features", help="Per-frame geometry from saved target poses, no inference.")
+    features.add_argument("path", type=Path, help="Existing target_poses.jsonl")
+    features.add_argument("--video-id", required=True, help="Verified dataset video ID")
+    features.add_argument("--output-dir", type=Path, required=True, help="New versioned output directory")
+    features.add_argument("--max-time-gap", type=float, default=0.5,
+                          help="Maximum adjacent-frame gap for backward differences, seconds (experimental default0.5)")
+    for baseline_command in ("action-baseline", "action-baseline-v2"):
+        baseline = commands.add_parser(baseline_command, help="Experimental causal rules from saved features; no inference.")
+        baseline.add_argument("path", type=Path, help="Saved features.jsonl")
+        baseline.add_argument("--output-dir", type=Path, required=True, help="NEW versioned output directory")
+        baseline.add_argument("--config", type=Path, help="Optional JSON object overriding documented heuristic defaults")
     review = commands.add_parser("review-poses", help="Review saved pose detections without inference.")
     review.add_argument("path", type=Path)
     review.add_argument("--poses", type=Path, required=True)
@@ -77,6 +88,30 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == "doctor":
         doctor()
+    elif args.command in ("action-baseline", "action-baseline-v2"):
+        try:
+            import json
+            from .action_baseline import Config, run_baseline
+            if args.command == "action-baseline-v2":
+                from .action_baseline_v2 import run_baseline
+            settings = json.loads(args.config.read_text(encoding="utf-8")) if args.config else {}
+            result = run_baseline(args.path, args.output_dir, Config(**settings))
+        except (OSError, ValueError, TypeError) as exc:
+            parser.exit(1, f"Action baseline failed: {exc}\n")
+        print(f"Baseline: {result['status']}; rows={result['frame_count']}; labels={result['label_counts']}")
+        print(f"Outputs: {args.output_dir.resolve()}")
+        if not result["completed"]:
+            parser.exit(1, f"Baseline incomplete: {result['errors']}\n")
+    elif args.command == "extract-features":
+        try:
+            from .pose_features import extract_features
+            from .video_inspection import InspectionError
+            result = extract_features(args.path, args.output_dir, args.video_id, args.max_time_gap)
+        except (ImportError, InspectionError, OSError, ValueError) as exc:
+            parser.exit(1, f"Feature extraction failed: {exc}\n")
+        print(f"Features: {result['status']}; rows={result['written_frame_count']}; output={args.output_dir.resolve()}")
+        if not result["completed"]:
+            parser.exit(1, f"Features incomplete: {result['errors']}\n")
     elif args.command == 'compare-pose-backends':
         try:
             from .pose_comparison import compare_backends
