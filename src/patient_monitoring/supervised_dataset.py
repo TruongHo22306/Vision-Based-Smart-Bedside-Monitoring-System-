@@ -212,7 +212,9 @@ def build(manifest, output):
         write(output/'summary.json',dict(status='complete',classes=classes,
             accepted_windows=len(windows),rejection_records=len(rejected),
             rejection_reasons=dict(Counter(r['reason'] for r in rejected)),
-            split='not_feasible: only one labeled occasion; no confirmed moving windows'))
+            labeled_occasion_count=len({w['recording_occasion_group_id'] for w in windows}),
+            classes_without_windows=[c for c in CLASSES if not classes[c]['accepted_windows']],
+            split='unassigned; assess occasion grouping and class support before any split'))
         write(output/'manifest.json',dict(config=CONFIG,
             config_sha256=hashlib.sha256(json.dumps(CONFIG,sort_keys=True).encode()).hexdigest(),
             input_sha256=hashes, output_sha256={p.name:sha(p) for p in output.iterdir() if p.is_file()},
