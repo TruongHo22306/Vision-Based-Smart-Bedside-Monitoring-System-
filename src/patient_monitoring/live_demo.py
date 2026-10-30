@@ -12,6 +12,7 @@ from fractions import Fraction
 from pathlib import Path
 
 from .camera_io import Capture,capture_loop,offer_latest,BACKENDS
+from .live_diagnostics import image_size,prepare_settings,thread_snapshot,Performance,sample_telemetry
 BASE=Fraction(1,1000000000)
 _RUNTIME_LOADED=False
 
@@ -85,27 +86,40 @@ def aggregate_live(history,end):
     return value,reason
 
 
+def association_gap(value):
+    try:n=float(value)
+    except (ValueError,TypeError):raise argparse.ArgumentTypeError('Experimental association gap must be >0.5 and <=2 seconds')
+    if not math.isfinite(n) or not .5<n<=2:raise argparse.ArgumentTypeError('Experimental association gap must be >0.5 and <=2 seconds')
+    return n
+
+
 class LiveEngine:
-    def __init__(self,model,prep,schema):
+    def __init__(self,model,prep,schema,experimental_association_gap=None):
         load_runtime()
+        self.association_gap=.5 if experimental_association_gap is None else association_gap(experimental_association_gap)
+        self.decision_counts=Counter();self.unavailable_reasons=Counter();self.seed_events=0;self.reset_events=0;self.skipped_decisions=0
         self.model,self.prep,self.schema=model,prep,schema;self.epoch=0;self.reset()
     def reset(self):
+        if self.epoch:self.reset_events+=1
+        self.latest_step=None
         self.epoch+=1;self.association=None;self.extractor=FeatureExtractor('live');self.audit=TimelineAudit();self.history=deque(maxlen=256)
         self.origin=None;self.last_host=None;self.next_end=Fraction(0);self.label=None;self.reason='explicit_seed_required'
     def step(self,people,width,height,stamp,seed=None):
         if seed is not None:
-            self.reset();self.association=TargetAssociator(0,seed)
+            self.reset();self.seed_events+=1;self.association=TargetAssociator(0,seed,max_gap=self.association_gap)
         if self.last_host is not None and stamp<=self.last_host:raise ValueError('Nonincreasing host acquisition timestamp')
         self.last_host=stamp
         if self.association is None:return None,[],0.0
         if self.origin is None:self.origin=stamp
         r=self.audit.observe(stamp-self.origin,BASE);r.update(source_path='live-webcam',stream_index=0,width=width,height=height,people=people,person_count=len(people),inference_status='complete')
         selected=self.association.step(r);feat=self.extractor.step(selected);self.history.append(feat);now=Fraction(stamp-self.origin,1000000000)
+        self.latest_step=dict(association={k:selected.get(k) for k in ('status','reason','elapsed_since_reference_seconds','reference_frame_index','best_iou','runner_up_iou','iou_separation','candidates','association_ended')},feature_temporal_pair=feat['temporal_pair'])
         while len(self.history)>2 and self.history[1]['pts']*BASE<now-2:self.history.popleft()
         decisions=[];begin=time.perf_counter()
         # If processing stalled, account for skipped grid slots without unbounded log/list growth.
         missed=0
         while self.next_end<now-2:self.next_end+=Fraction(1,4);missed+=1
+        self.skipped_decisions+=missed
         if missed:decisions.append(dict(skipped_grid_decisions=missed,reason='processing_stall_no_retained_support',epoch=self.epoch))
         while self.next_end<=now:
             end=self.next_end;self.next_end+=Fraction(1,4)
@@ -116,10 +130,12 @@ class LiveEngine:
                 with torch.no_grad():scores=self.model(torch.from_numpy(x)).softmax(1)[0]
                 if not torch.isfinite(scores).all():raise ValueError('Nonfinite model output')
                 d.update(label=CLASSES[int(scores.argmax())],scores_uncalibrated=scores.tolist(),coverage={k:v['coverage'] for k,v in value['model_inputs'].items()},missing=[k for k,v in value['model_inputs'].items() if not v['valid']])
+            self.decision_counts['available' if value else 'unavailable']+=1
+            if not value:self.unavailable_reasons[reason]+=1
             self.label=d['label'];self.reason=reason;decisions.append(d)
         invalid=selected['selected_person'] is None
         broken=feat['frame_index']>0 and not feat['temporal_pair']['valid']
-        if invalid or broken:self.label=None;self.reason=selected['status'] if invalid else 'temporal_track_break'
+        if invalid or broken:self.label=None;self.reason=selected['status'] if invalid else 'feature_continuity:'+str(feat['temporal_pair']['reason'])
         return selected,decisions,time.perf_counter()-begin
 
 
@@ -139,21 +155,42 @@ def paint(frame,people,selected,engine,rate,age):
 
 def run(args):
     if args.camera<0 or (args.duration is not None and (not math.isfinite(args.duration) or args.duration<=0)):raise ValueError('Invalid camera/duration')
+    experimental_gap=getattr(args,'experimental_association_gap',None)
+    if experimental_gap is not None:experimental_gap=association_gap(experimental_gap)
+    pose_backend=getattr(args,'pose_backend','pt')
+    imgsz=image_size(getattr(args,'imgsz',640))
     weights=Path(args.weights);modeldir=Path(args.model_dir);out=Path(args.output_dir)
     if out.exists():raise FileExistsError(f'Output exists: {out}. Choose a NEW --output-dir; nothing overwritten.')
-    load_runtime();out.mkdir(parents=True,exist_ok=False)
-    info=dict(status='incomplete',errors=[],processed=0,raw_video_recorded=False,camera=args.camera,backend=args.backend);write(out/'summary.json',info)
+    out.mkdir(parents=True,exist_ok=False)
+    settings_paths=prepare_settings(out)  # existing absolute writable dirs BEFORE any runtime/Ultralytics import
+    load_runtime()
+    from .live_pose import validate_pose,load_pose,ncnn_snapshot,package_versions
+    predict_config={**PREDICT_CONFIG,'imgsz':imgsz}
+    info=dict(status='incomplete',errors=[],processed=0,raw_video_recorded=False,camera=args.camera,backend=args.backend,pose_backend=pose_backend,association_mode='strict' if experimental_gap is None else 'experimental_low_rate',association_max_gap_seconds=.5 if experimental_gap is None else experimental_gap,feature_window_max_gap_seconds=.5,packages=package_versions(),pose_config=predict_config,settings_paths=settings_paths,thread_snapshots=[],telemetry_samples=0);write(out/'summary.json',info)
     warning_filter=None;pose_logger=None;capture=None;log=None;started=time.monotonic();ages=[];poses=[];class_times=[];statuses=Counter();last_stamp=None;last_picture=None
+    engine=None
+    performance=Performance();last_telemetry=None
+    def threads(stage):
+        snapshot=thread_snapshot(stage,torch);info['thread_snapshots'].append(snapshot);write(out/'summary.json',info)
+    def telemetry(event):
+        nonlocal last_telemetry
+        sample=sample_telemetry();last_telemetry=time.monotonic();info['telemetry_samples']+=1
+        info['latest_telemetry']=sample
+        if log:log.add(dict(type='telemetry',event=event,monotonic_ns=time.monotonic_ns(),**sample))
     try:
-        if not weights.is_file() or sha(weights)!=MODEL_SHA256:raise ValueError('Existing verified local YOLO11n pose weights required; no downloads')
+        identity=validate_pose(weights,pose_backend,imgsz);info['pose_identity']=identity
         frozen=verify_live_manifest(modeldir)
-        model,prep,schema=load_bundle(modeldir);engine=LiveEngine(model,prep,schema)
-        os.environ['YOLO_OFFLINE']='true';os.environ['YOLO_AUTOINSTALL']='false';os.environ['YOLO_CONFIG_DIR']=str(out/'ultralytics_settings');os.environ['MPLCONFIGDIR']=str(out/'matplotlib_settings')
+        threads('before_classifier_load')
+        model,prep,schema=load_bundle(modeldir)
+        threads('after_classifier_load')
+        engine=LiveEngine(model,prep,schema,experimental_gap)
         from ultralytics import YOLO
         from ultralytics.utils import LOGGER
         pose_logger=LOGGER;warning_filter=HalfWarningOnce();pose_logger.addFilter(warning_filter)
-        pose=YOLO(str(weights.resolve()),task='pose')
-        log=Log(out/'diagnostics.jsonl');capture=Capture(args.camera,args.backend);opened=time.monotonic();first_stamp=None
+        pose=load_pose(weights,pose_backend,out,predict_config)
+        if pose_backend=='ncnn':info['pose_runtime_after_load']=ncnn_snapshot(pose,predict_config)
+        threads('after_yolo_initialization')
+        log=Log(out/'diagnostics.jsonl');telemetry('before_capture');capture=Capture(args.camera,args.backend);opened=time.monotonic();first_stamp=None
         while True:
             elapsed=time.monotonic()-opened
             if args.duration and elapsed>=args.duration:break
@@ -174,15 +211,23 @@ def run(args):
             interval=None if last_stamp is None else (stamp-last_stamp)/1e9;last_stamp=stamp
             if first_stamp is None:first_stamp=stamp
             before=time.monotonic_ns();start=time.perf_counter()
-            prediction=pose.predict(source=Image.fromarray(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)),**PREDICT_CONFIG)[0]
+            source=Image.fromarray(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB))
+            predict_started=time.perf_counter()
+            prediction=pose.predict(source=source,**predict_config)[0]
+            predict_seconds=time.perf_counter()-predict_started
             people=quality_people(prediction,frame.shape[1],frame.shape[0]);pose_seconds=time.perf_counter()-start
+            performance.observe(predict_seconds,interval)
+            if info['processed']==0:
+                if pose_backend=='ncnn':info['pose_runtime_after_first_predict']=ncnn_snapshot(pose,predict_config)
+                threads('after_first_predict')
             selected,decisions,class_seconds=engine.step(people,frame.shape[1],frame.shape[0],stamp)
             info['processed']+=1;status=selected['status'] if selected else 'awaiting_explicit_seed';statuses[status]+=1
-            age=(time.monotonic_ns()-stamp)/1e9;rate=info['processed']/(time.monotonic()-opened)
+            age=(time.monotonic_ns()-stamp)/1e9;rate_elapsed=time.monotonic()-opened;rate=info['processed']/rate_elapsed if rate_elapsed>0 else 0.
             # Fixed-size measurement rings; summary contains total count plus latest256-sample statistics.
             ages.append(age);poses.append(pose_seconds);class_times.append(class_seconds)
             if len(ages)>256:ages.pop(0);poses.pop(0);class_times.pop(0)
-            log.add(dict(type='frame',capture_sequence=seq,host_acquired_ns=stamp,processed_index=info['processed']-1,processed_interval_seconds=interval,epoch=engine.epoch,target_status=status,label=engine.label,reason=engine.reason,pose_seconds=pose_seconds,classifier_aggregation_seconds=class_seconds,age_before_pose_seconds=(before-stamp)/1e9,host_age_before_display_seconds=age,captured=capture.counters[0],overwritten=capture.counters[1],dropped_incoming=capture.counters[2],drained=capture.drained,people=len(people),selected_detection=None if selected is None else selected['selected_source_detection_index']))
+            log.add(dict(type='frame',capture_sequence=seq,host_acquired_ns=stamp,processed_index=info['processed']-1,processed_interval_seconds=interval,tracking_diagnostics=engine.latest_step,exceeds_continuity_limit=None if interval is None else interval>.5,predict_seconds=predict_seconds,predict_phase='first' if info['processed']==1 else 'subsequent',ultralytics_speed_ms=getattr(prediction,'speed',None),epoch=engine.epoch,target_status=status,label=engine.label,reason=engine.reason,pose_seconds=pose_seconds,classifier_aggregation_seconds=class_seconds,age_before_pose_seconds=(before-stamp)/1e9,host_age_before_display_seconds=age,captured=capture.counters[0],overwritten=capture.counters[1],dropped_incoming=capture.counters[2],drained=capture.drained,people=len(people),selected_detection=None if selected is None else selected['selected_source_detection_index']))
+            if info['processed']==1 or time.monotonic()-last_telemetry>=5:telemetry('after_first_predict' if info['processed']==1 else 'periodic_after_predict')
             for d in decisions:log.add(dict(type='decision',**d))
             if not args.no_display:
                 cv2.imshow('Patient monitoring development',paint(frame,people,selected,engine,rate,age));key=cv2.waitKey(1)&255
@@ -193,13 +238,14 @@ def run(args):
                     detection=key-ord('0')
                     # Seed the exact just-displayed image/detection, never a future frame.
                     selected,ds,_=engine.step(people,frame.shape[1],frame.shape[0],stamp,seed=detection)
-                    log.add(dict(type='explicit_seed',host_acquired_ns=stamp,capture_sequence=seq,detection=detection,epoch=engine.epoch,status=selected['status']))
+                    log.add(dict(type='explicit_seed',host_acquired_ns=stamp,capture_sequence=seq,detection=detection,epoch=engine.epoch,status=selected['status'],tracking_diagnostics=engine.latest_step))
+                    for d in ds:log.add(dict(type='decision',**d))
             if info['processed']%10==0:print('Processed',info['processed'],'rate',round(rate,2),'target',status,flush=True)
         if not info['processed']:raise RuntimeError('No camera frames processed within run duration')
         info.update(status='complete',acquisition_span_seconds=(last_stamp-first_stamp)/1e9,capture_rate_over_observed_span=None)
         verify_live_manifest(modeldir)
-        if sha(weights)!=MODEL_SHA256:raise ValueError('Pose weights changed')
-        info.update(pose_config=PREDICT_CONFIG,pose_sha256=MODEL_SHA256,frozen_manifest_sha256=sha(modeldir/'frozen_manifest.json'))
+        if validate_pose(weights,pose_backend,imgsz)!=identity:raise ValueError('Pose artifacts changed')
+        info.update(pose_config=predict_config,pose_sha256=identity['sha256'],frozen_manifest_sha256=sha(modeldir/'frozen_manifest.json'))
     except KeyboardInterrupt:info['status']='stopped_by_user'
     except BaseException as exc:info['status']='incomplete';info['errors'].append(repr(exc))
     finally:
@@ -208,11 +254,16 @@ def run(args):
             span=(info['capture_last_host_ns']-info['capture_first_host_ns'])/1e9
             info['capture_rate_over_observed_span']=(info['captured']-1)/span if span>0 else None
             info['unprocessed_on_stop']=max(0,info['captured']-info['processed']-info['overwritten_pending']-info['dropped_incoming']-info['drained_older'])
+        if log:telemetry('after_capture_cleanup')
+        info.update(performance.summary())
+        info['continuity_note']='Adjacent gaps >0.5s invalidate feature/window continuity. Target lifetime is separately configured; compare association reference age to association_max_gap_seconds.'
+        if engine:info.update(decision_counts={k:engine.decision_counts[k] for k in ('available','unavailable')},unavailable_decision_reasons=dict(engine.unavailable_reasons),skipped_grid_decisions=engine.skipped_decisions,explicit_seed_events=engine.seed_events,history_reset_events=engine.reset_events,reset_count_note='Includes reseed-triggered resets, excludes construction')
         if not args.no_display:cv2.destroyAllWindows()
         if warning_filter:
             pose_logger.removeFilter(warning_filter);info['duplicate_half_warnings_suppressed']=warning_filter.suppressed
         if log:info['log_omitted_records']=log.omitted;info['log_bytes']=log.size;log.close()
-        info.update(elapsed_seconds=time.monotonic()-started,target_status_counts=dict(statuses),processing_rate_per_second=info['processed']/(time.monotonic()-opened) if capture else None,
+        processing_elapsed=time.monotonic()-opened if capture else 0.
+        info.update(elapsed_seconds=time.monotonic()-started,target_status_counts=dict(statuses),processing_rate_per_second=info['processed']/processing_elapsed if processing_elapsed>0 else None,
             latest_sample_count=len(ages),latest_mean_frame_host_age_seconds=float(np.mean(ages)) if ages else None,latest_mean_pose_seconds=float(np.mean(poses)) if poses else None,latest_mean_classifier_aggregation_seconds=float(np.mean(class_times)) if class_times else None,
             timestamp_policy='monotonic_ns immediately after capture.read; host acquisition, not verified sensor exposure',latency_policy='host read-return to pre-display only; excludes sensor/backend/display refresh; NOT sensor-to-screen latency',buffer_policy='one pending frame; history<=256processed frames and approximately2s; logs<=10MB; measurement rings256',source_sha256=sha(__file__))
         write(out/'summary.json',info)
@@ -220,7 +271,7 @@ def run(args):
 
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--camera',type=int,required=True);p.add_argument('--backend',choices=BACKENDS,default='auto');p.add_argument('--weights',required=True);p.add_argument('--model-dir',required=True);p.add_argument('--output-dir',required=True);p.add_argument('--duration',type=float);p.add_argument('--no-display',action='store_true',help='smoke test only; remains unseeded, no automatic person selection')
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--experimental-association-gap',type=association_gap,help='Explicit experimental association lifetime >0.5 to 2 seconds; feature/window limit stays0.5');p.add_argument('--camera',type=int,required=True);p.add_argument('--pose-backend',choices=('pt','ncnn'),default='pt');p.add_argument('--imgsz',type=image_size,default=640);p.add_argument('--backend',choices=BACKENDS,default='auto');p.add_argument('--weights',required=True);p.add_argument('--model-dir',required=True);p.add_argument('--output-dir',required=True);p.add_argument('--duration',type=float);p.add_argument('--no-display',action='store_true',help='smoke test only; remains unseeded, no automatic person selection')
     a=p.parse_args()
     try:result=run(a)
     except FileExistsError as exc:p.exit(2,str(exc)+'\n')
