@@ -22,6 +22,10 @@ class LowRateExperimentTests(unittest.TestCase):
  def test_training_only_missing_and_constant(self):
   x=np.zeros((2,35));x[:,0]=np.nan;x[:,1]=[2,4];p=fit(x);self.assertTrue(p['fallback'][0]);self.assertEqual(p['medians'][1],3)
   held=x.copy();held[:,1]=100;before=json.dumps(p);y=apply(held,p);self.assertTrue(np.isfinite(y).all());self.assertEqual(json.dumps(p),before)
+ def test_window_does_not_read_future_features(self):
+  rows=[row(i,i*1000,shift=i) for i in range(6)];f=recompute(rows,list(range(6)),'test',1.5);times=[F(i) for i in range(6)]
+  expected=window(f,times,F(3),C)
+  f[4]['features']={'poison':True};self.assertEqual(window(f,times,F(3),C),expected)
  def test_irregular_selection_unique_no_future(self):
   times=[F(i,10) for i in range(60)];ids=select(times,[.5,.75,1,1.25]);self.assertEqual(len(ids),len(set(ids)));self.assertEqual(ids[:4],[0,5,13,23])
 if __name__=='__main__':unittest.main()

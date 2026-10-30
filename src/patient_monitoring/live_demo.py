@@ -148,13 +148,15 @@ def paint(frame,people,selected,engine,rate,age):
         for a,b in EDGES:
             if j[a]['passes_quality_gate'] and j[b]['passes_quality_gate']:cv2.line(image,(int(j[a]['x']),int(j[a]['y'])),(int(j[b]['x']),int(j[b]['y'])),(0,255,0),2)
     footer=np.zeros((150,image.shape[1],3),np.uint8)
-    for i,text in enumerate(['EXPERIMENTAL DEVELOPMENT | NOT GROUND TRUTH',f"{engine.label or 'UNAVAILABLE'} | {engine.reason or 'available window'}",f'Processing {rate:.2f}/s | host frame age {age:.3f}s', '0-9: seed displayed D | r: reset | q/ESC: stop','No calibrated confidence; no sensor latency estimate']):
+    for i,text in enumerate([('LOW-RATE EXPERIMENTAL | NOT GROUND TRUTH' if getattr(engine,'classifier_mode','strict')=='low-rate' else 'EXPERIMENTAL DEVELOPMENT | NOT GROUND TRUTH'),f"{engine.label or 'UNAVAILABLE'} | {engine.reason or 'available window'}",f'Processing {rate:.2f}/s | host frame age {age:.3f}s', '0-9: seed displayed D | r: reset | q/ESC: stop','No calibrated confidence; no sensor latency estimate']):
         cv2.putText(footer,text,(6,24+i*28),cv2.FONT_HERSHEY_SIMPLEX,min(.55,(image.shape[1]-12)/(max(len(text),1)*11)),(255,255,255),1)
     return np.vstack([image,footer])
 
 
 def run(args):
     if args.camera<0 or (args.duration is not None and (not math.isfinite(args.duration) or args.duration<=0)):raise ValueError('Invalid camera/duration')
+    classifier_mode=getattr(args,'classifier','strict')
+    if classifier_mode not in ('strict','low-rate'):raise ValueError('Invalid classifier mode')
     experimental_gap=getattr(args,'experimental_association_gap',None)
     if experimental_gap is not None:experimental_gap=association_gap(experimental_gap)
     pose_backend=getattr(args,'pose_backend','pt')
@@ -166,7 +168,7 @@ def run(args):
     load_runtime()
     from .live_pose import validate_pose,load_pose,ncnn_snapshot,package_versions
     predict_config={**PREDICT_CONFIG,'imgsz':imgsz}
-    info=dict(status='incomplete',errors=[],processed=0,raw_video_recorded=False,camera=args.camera,backend=args.backend,pose_backend=pose_backend,association_mode='strict' if experimental_gap is None else 'experimental_low_rate',association_max_gap_seconds=.5 if experimental_gap is None else experimental_gap,feature_window_max_gap_seconds=.5,packages=package_versions(),pose_config=predict_config,settings_paths=settings_paths,thread_snapshots=[],telemetry_samples=0);write(out/'summary.json',info)
+    info=dict(status='incomplete',errors=[],processed=0,raw_video_recorded=False,classifier_mode=classifier_mode,camera=args.camera,backend=args.backend,pose_backend=pose_backend,association_mode='strict' if experimental_gap is None else 'experimental_low_rate',association_max_gap_seconds=.5 if experimental_gap is None else experimental_gap,feature_window_max_gap_seconds=.5,packages=package_versions(),pose_config=predict_config,settings_paths=settings_paths,thread_snapshots=[],telemetry_samples=0);write(out/'summary.json',info)
     warning_filter=None;pose_logger=None;capture=None;log=None;started=time.monotonic();ages=[];poses=[];class_times=[];statuses=Counter();last_stamp=None;last_picture=None
     engine=None
     performance=Performance();last_telemetry=None
@@ -179,11 +181,16 @@ def run(args):
         if log:log.add(dict(type='telemetry',event=event,monotonic_ns=time.monotonic_ns(),**sample))
     try:
         identity=validate_pose(weights,pose_backend,imgsz);info['pose_identity']=identity
-        frozen=verify_live_manifest(modeldir)
         threads('before_classifier_load')
-        model,prep,schema=load_bundle(modeldir)
+        if classifier_mode=='strict':
+            frozen=verify_live_manifest(modeldir);model,prep,schema=load_bundle(modeldir)
+            engine=LiveEngine(model,prep,schema,experimental_gap)
+            info['classifier_artifact_hashes']={n:sha(modeldir/n) for n in ('model_state.pt','preprocessing.json','feature_schema.json','config.json')}
+        else:
+            from .live_low_rate import load_low_rate,verify_bundle,LowRateEngine
+            model,prep,schema,config=load_low_rate(modeldir);engine=LowRateEngine(model,prep,schema,config,experimental_gap)
+            info.update(classifier_artifact_hashes=verify_bundle(modeldir),classifier_config=config,feature_window_max_gap_seconds=config['max_gap_seconds'])
         threads('after_classifier_load')
-        engine=LiveEngine(model,prep,schema,experimental_gap)
         from ultralytics import YOLO
         from ultralytics.utils import LOGGER
         pose_logger=LOGGER;warning_filter=HalfWarningOnce();pose_logger.addFilter(warning_filter)
@@ -200,16 +207,29 @@ def run(args):
             if timeout:raise TimeoutError(timeout+' (10s for current stage; inspect startup_stages)')
             item=capture.newest()
             if item is None:
-                if last_stamp is not None and (time.monotonic_ns()-last_stamp)/1e9>.5:
+                if classifier_mode=='low-rate':engine.expire_display(time.monotonic_ns())
+                if last_stamp is not None and (time.monotonic_ns()-last_stamp)/1e9>(.5 if classifier_mode=='strict' else config['max_latest_age_seconds']):
                     engine.label=None;engine.reason='waiting_for_fresh_processed_frame'
                     if not args.no_display and last_picture is not None:
                         cv2.imshow('Patient monitoring development',paint(last_picture,[],None,engine,info['processed']/max(elapsed,.001),(time.monotonic_ns()-last_stamp)/1e9))
-                if not args.no_display and cv2.waitKey(1)&255 in (27,ord('q')):break
+                if classifier_mode=='low-rate' and engine.label is None and not args.no_display and last_picture is not None:
+                    cv2.imshow('Patient monitoring development',paint(last_picture,[],None,engine,info['processed']/max(elapsed,.001),(time.monotonic_ns()-last_stamp)/1e9))
+                if not args.no_display:
+                    key=cv2.waitKey(1)&255
+                    if key in (27,ord('q')):break
+                    if classifier_mode=='low-rate' and key==ord('r'):engine.reset();log.add(dict(type='explicit_reset',host_ns=time.monotonic_ns(),epoch=engine.epoch))
                 continue
             seq,stamp,frame=item;last_picture=frame
             if last_stamp is not None and stamp<=last_stamp:raise ValueError('Capture timestamp did not increase')
             interval=None if last_stamp is None else (stamp-last_stamp)/1e9;last_stamp=stamp
             if first_stamp is None:first_stamp=stamp
+            if classifier_mode=='low-rate' and not args.no_display:
+                # Never leave a previous label displayed while synchronous pose inference blocks UI.
+                old_label,old_reason=engine.label,engine.reason;engine.label=None;engine.reason='processing_fresh_frame'
+                cv2.imshow('Patient monitoring development',paint(frame,[],None,engine,info['processed']/max(elapsed,.001),(time.monotonic_ns()-stamp)/1e9));key=cv2.waitKey(1)&255
+                engine.label,engine.reason=old_label,old_reason
+                if key in (27,ord('q')):break
+                if key==ord('r'):engine.reset();log.add(dict(type='explicit_reset',host_ns=time.monotonic_ns(),epoch=engine.epoch))
             before=time.monotonic_ns();start=time.perf_counter()
             source=Image.fromarray(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB))
             predict_started=time.perf_counter()
@@ -226,9 +246,11 @@ def run(args):
             # Fixed-size measurement rings; summary contains total count plus latest256-sample statistics.
             ages.append(age);poses.append(pose_seconds);class_times.append(class_seconds)
             if len(ages)>256:ages.pop(0);poses.pop(0);class_times.pop(0)
-            log.add(dict(type='frame',capture_sequence=seq,host_acquired_ns=stamp,processed_index=info['processed']-1,processed_interval_seconds=interval,tracking_diagnostics=engine.latest_step,exceeds_continuity_limit=None if interval is None else interval>.5,predict_seconds=predict_seconds,predict_phase='first' if info['processed']==1 else 'subsequent',ultralytics_speed_ms=getattr(prediction,'speed',None),epoch=engine.epoch,target_status=status,label=engine.label,reason=engine.reason,pose_seconds=pose_seconds,classifier_aggregation_seconds=class_seconds,age_before_pose_seconds=(before-stamp)/1e9,host_age_before_display_seconds=age,captured=capture.counters[0],overwritten=capture.counters[1],dropped_incoming=capture.counters[2],drained=capture.drained,people=len(people),selected_detection=None if selected is None else selected['selected_source_detection_index']))
+            if classifier_mode=='low-rate':engine.expire_display(time.monotonic_ns())
+            log.add(dict(type='frame',mode=classifier_mode,capture_sequence=seq,host_acquired_ns=stamp,processed_index=info['processed']-1,processed_interval_seconds=interval,tracking_diagnostics=engine.latest_step,exceeds_continuity_limit=None if interval is None else interval>info['feature_window_max_gap_seconds'],predict_seconds=predict_seconds,predict_phase='first' if info['processed']==1 else 'subsequent',ultralytics_speed_ms=getattr(prediction,'speed',None),epoch=engine.epoch,target_status=status,label=engine.label,reason=engine.reason,pose_seconds=pose_seconds,classifier_aggregation_seconds=class_seconds,age_before_pose_seconds=(before-stamp)/1e9,host_age_before_display_seconds=age,captured=capture.counters[0],overwritten=capture.counters[1],dropped_incoming=capture.counters[2],drained=capture.drained,people=len(people),selected_detection=None if selected is None else selected['selected_source_detection_index']))
             if info['processed']==1 or time.monotonic()-last_telemetry>=5:telemetry('after_first_predict' if info['processed']==1 else 'periodic_after_predict')
             for d in decisions:log.add(dict(type='decision',**d))
+            if classifier_mode=='low-rate':engine.expire_display(time.monotonic_ns())
             if not args.no_display:
                 cv2.imshow('Patient monitoring development',paint(frame,people,selected,engine,rate,age));key=cv2.waitKey(1)&255
                 if key in (27,ord('q')):break
@@ -243,9 +265,10 @@ def run(args):
             if info['processed']%10==0:print('Processed',info['processed'],'rate',round(rate,2),'target',status,flush=True)
         if not info['processed']:raise RuntimeError('No camera frames processed within run duration')
         info.update(status='complete',acquisition_span_seconds=(last_stamp-first_stamp)/1e9,capture_rate_over_observed_span=None)
-        verify_live_manifest(modeldir)
+        if classifier_mode=='strict':verify_live_manifest(modeldir)
+        else:verify_bundle(modeldir)
         if validate_pose(weights,pose_backend,imgsz)!=identity:raise ValueError('Pose artifacts changed')
-        info.update(pose_config=predict_config,pose_sha256=identity['sha256'],frozen_manifest_sha256=sha(modeldir/'frozen_manifest.json'))
+        info.update(pose_config=predict_config,pose_sha256=identity['sha256'],frozen_manifest_sha256=sha(modeldir/'frozen_manifest.json') if classifier_mode=='strict' else None)
     except KeyboardInterrupt:info['status']='stopped_by_user'
     except BaseException as exc:info['status']='incomplete';info['errors'].append(repr(exc))
     finally:
@@ -256,7 +279,7 @@ def run(args):
             info['unprocessed_on_stop']=max(0,info['captured']-info['processed']-info['overwritten_pending']-info['dropped_incoming']-info['drained_older'])
         if log:telemetry('after_capture_cleanup')
         info.update(performance.summary())
-        info['continuity_note']='Adjacent gaps >0.5s invalidate feature/window continuity. Target lifetime is separately configured; compare association reference age to association_max_gap_seconds.'
+        info['continuity_note']='Feature/window gap is feature_window_max_gap_seconds; association is independently configured. Display low-rate expiry uses frozen max_latest_age_seconds.'
         if engine:info.update(decision_counts={k:engine.decision_counts[k] for k in ('available','unavailable')},unavailable_decision_reasons=dict(engine.unavailable_reasons),skipped_grid_decisions=engine.skipped_decisions,explicit_seed_events=engine.seed_events,history_reset_events=engine.reset_events,reset_count_note='Includes reseed-triggered resets, excludes construction')
         if not args.no_display:cv2.destroyAllWindows()
         if warning_filter:
@@ -265,13 +288,13 @@ def run(args):
         processing_elapsed=time.monotonic()-opened if capture else 0.
         info.update(elapsed_seconds=time.monotonic()-started,target_status_counts=dict(statuses),processing_rate_per_second=info['processed']/processing_elapsed if processing_elapsed>0 else None,
             latest_sample_count=len(ages),latest_mean_frame_host_age_seconds=float(np.mean(ages)) if ages else None,latest_mean_pose_seconds=float(np.mean(poses)) if poses else None,latest_mean_classifier_aggregation_seconds=float(np.mean(class_times)) if class_times else None,
-            timestamp_policy='monotonic_ns immediately after capture.read; host acquisition, not verified sensor exposure',latency_policy='host read-return to pre-display only; excludes sensor/backend/display refresh; NOT sensor-to-screen latency',buffer_policy='one pending frame; history<=256processed frames and approximately2s; logs<=10MB; measurement rings256',source_sha256=sha(__file__))
+            timestamp_policy='monotonic_ns immediately after capture.read; host acquisition, not verified sensor exposure',latency_policy='host read-return to pre-display only; excludes sensor/backend/display refresh; NOT sensor-to-screen latency',buffer_policy='one pending frame; history<=256processed frames; strict~2s, low-rate retention from config window+2gap+stride; logs<=10MB; measurement rings256',source_sha256=sha(__file__))
         write(out/'summary.json',info)
     print(json.dumps(info),flush=True);return info
 
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--experimental-association-gap',type=association_gap,help='Explicit experimental association lifetime >0.5 to 2 seconds; feature/window limit stays0.5');p.add_argument('--camera',type=int,required=True);p.add_argument('--pose-backend',choices=('pt','ncnn'),default='pt');p.add_argument('--imgsz',type=image_size,default=640);p.add_argument('--backend',choices=BACKENDS,default='auto');p.add_argument('--weights',required=True);p.add_argument('--model-dir',required=True);p.add_argument('--output-dir',required=True);p.add_argument('--duration',type=float);p.add_argument('--no-display',action='store_true',help='smoke test only; remains unseeded, no automatic person selection')
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--classifier',choices=('strict','low-rate'),default='strict');p.add_argument('--experimental-association-gap',type=association_gap,help='Explicit experimental association lifetime >0.5 to 2 seconds; feature/window limits come from selected classifier');p.add_argument('--camera',type=int,required=True);p.add_argument('--pose-backend',choices=('pt','ncnn'),default='pt');p.add_argument('--imgsz',type=image_size,default=640);p.add_argument('--backend',choices=BACKENDS,default='auto');p.add_argument('--weights',required=True);p.add_argument('--model-dir',required=True);p.add_argument('--output-dir',required=True);p.add_argument('--duration',type=float);p.add_argument('--no-display',action='store_true',help='smoke test only; remains unseeded, no automatic person selection')
     a=p.parse_args()
     try:result=run(a)
     except FileExistsError as exc:p.exit(2,str(exc)+'\n')
