@@ -7,6 +7,8 @@ import multiprocessing as mp
 import os
 import queue
 import time
+import threading
+import sys
 from collections import deque,Counter
 from fractions import Fraction
 from pathlib import Path
@@ -60,12 +62,40 @@ def verify_live_manifest(modeldir):
 
 class Log:
     def __init__(self,path,max_bytes=10000000):
-        self.file=Path(path).open('x',encoding='utf-8');self.size=0;self.limit=max_bytes;self.omitted=0
+        self.lock=threading.Lock();self.file=Path(path).open('x',encoding='utf-8');self.size=0;self.limit=max_bytes;self.omitted=0
     def add(self,record):
         text=json.dumps(record,allow_nan=False)+'\n';size=len(text.encode('utf-8'))
-        if self.size+size>self.limit:self.omitted+=1;return
-        self.file.write(text);self.file.flush();self.size+=size
+        with self.lock:
+            if self.size+size>self.limit:self.omitted+=1;return
+            self.file.write(text);self.file.flush();self.size+=size
     def close(self):self.file.close()
+
+
+
+class DisplaySummary:
+    """Processed-frame render assessments, not screen visibility/dwell time."""
+    def __init__(self):
+        self.frames=0;self.ready=0;self.submitted=0;self.reasons=Counter()
+    def observe(self,engine,host_now,ui_enabled):
+        engine.expire_display(host_now)
+        label=engine.label;reason=engine.reason
+        self.frames+=1;self.ready+=int(label is not None)
+        submitted=ui_enabled and label is not None
+        self.submitted+=int(submitted)
+        absent=None if submitted else ('ui_disabled' if label is not None else reason or 'unavailable')
+        if absent:self.reasons[absent]+=1
+        support=engine.display_support_host_ns
+        return dict(type='display_assessment',assessed_host_ns=host_now,label=label,
+                    reason=reason,ui_enabled=ui_enabled,label_submitted_to_ui=submitted,
+                    non_display_reason=absent,decision_host_ns=engine.display_decision_host_ns,
+                    computed_host_ns=engine.display_computed_host_ns,latest_support_host_ns=support,
+                    support_age_seconds=None if support is None else (host_now-support)/1e9)
+    def summary(self):
+        return dict(processed_frame_assessments=self.frames,frames_with_fresh_label=self.ready,
+                    frames_with_label_submitted_to_ui=self.submitted,
+                    frames_without_label_submitted_to_ui=self.frames-self.submitted,
+                    non_display_reasons=dict(self.reasons),
+                    policy='One assessment per processed frame after telemetry/logging, before UI submission; not screen dwell time or proof of physical display. Historical decision availability is separate.')
 
 
 def aggregate_live(history,end):
@@ -157,6 +187,8 @@ def run(args):
     if args.camera<0 or (args.duration is not None and (not math.isfinite(args.duration) or args.duration<=0)):raise ValueError('Invalid camera/duration')
     classifier_mode=getattr(args,'classifier','strict')
     if classifier_mode not in ('strict','low-rate'):raise ValueError('Invalid classifier mode')
+    asynchronous=getattr(args,'async_ui',False)
+    if asynchronous and classifier_mode!='low-rate':raise ValueError('--async-ui requires --classifier low-rate; strict is unchanged')
     experimental_gap=getattr(args,'experimental_association_gap',None)
     if experimental_gap is not None:experimental_gap=association_gap(experimental_gap)
     pose_backend=getattr(args,'pose_backend','pt')
@@ -168,9 +200,10 @@ def run(args):
     load_runtime()
     from .live_pose import validate_pose,load_pose,ncnn_snapshot,package_versions
     predict_config={**PREDICT_CONFIG,'imgsz':imgsz}
-    info=dict(status='incomplete',errors=[],processed=0,raw_video_recorded=False,classifier_mode=classifier_mode,camera=args.camera,backend=args.backend,pose_backend=pose_backend,association_mode='strict' if experimental_gap is None else 'experimental_low_rate',association_max_gap_seconds=.5 if experimental_gap is None else experimental_gap,feature_window_max_gap_seconds=.5,packages=package_versions(),pose_config=predict_config,settings_paths=settings_paths,thread_snapshots=[],telemetry_samples=0);write(out/'summary.json',info)
+    info=dict(status='incomplete',errors=[],processed=0,async_ui_enabled=asynchronous,raw_video_recorded=False,classifier_mode=classifier_mode,camera=args.camera,backend=args.backend,pose_backend=pose_backend,association_mode='strict' if experimental_gap is None else 'experimental_low_rate',association_max_gap_seconds=.5 if experimental_gap is None else experimental_gap,feature_window_max_gap_seconds=.5,packages=package_versions(),pose_config=predict_config,settings_paths=settings_paths,thread_snapshots=[],telemetry_samples=0);write(out/'summary.json',info)
     warning_filter=None;pose_logger=None;capture=None;log=None;started=time.monotonic();ages=[];poses=[];class_times=[];statuses=Counter();last_stamp=None;last_picture=None
     engine=None
+    display_summary=DisplaySummary()
     performance=Performance();last_telemetry=None
     def threads(stage):
         snapshot=thread_snapshot(stage,torch);info['thread_snapshots'].append(snapshot);write(out/'summary.json',info)
@@ -198,7 +231,12 @@ def run(args):
         if pose_backend=='ncnn':info['pose_runtime_after_load']=ncnn_snapshot(pose,predict_config)
         threads('after_yolo_initialization')
         log=Log(out/'diagnostics.jsonl');telemetry('before_capture');capture=Capture(args.camera,args.backend);opened=time.monotonic();first_stamp=None
-        while True:
+        if asynchronous:
+            from .live_async_ui import run_loop
+            stats=run_loop(sys.modules[__name__],args,capture,pose,engine,predict_config,info,log,performance,telemetry,threads,opened)
+            first_stamp,last_stamp=stats['first_stamp'],stats['last_stamp']
+            statuses.update(info.get('target_status_counts',{}))
+        while not asynchronous:
             elapsed=time.monotonic()-opened
             if args.duration and elapsed>=args.duration:break
             if capture.status.value<0:raise RuntimeError('Camera open/read failure (capture process status=-1)')
@@ -250,9 +288,12 @@ def run(args):
             log.add(dict(type='frame',mode=classifier_mode,capture_sequence=seq,host_acquired_ns=stamp,processed_index=info['processed']-1,processed_interval_seconds=interval,tracking_diagnostics=engine.latest_step,exceeds_continuity_limit=None if interval is None else interval>info['feature_window_max_gap_seconds'],predict_seconds=predict_seconds,predict_phase='first' if info['processed']==1 else 'subsequent',ultralytics_speed_ms=getattr(prediction,'speed',None),epoch=engine.epoch,target_status=status,label=engine.label,reason=engine.reason,pose_seconds=pose_seconds,classifier_aggregation_seconds=class_seconds,age_before_pose_seconds=(before-stamp)/1e9,host_age_before_display_seconds=age,captured=capture.counters[0],overwritten=capture.counters[1],dropped_incoming=capture.counters[2],drained=capture.drained,people=len(people),selected_detection=None if selected is None else selected['selected_source_detection_index']))
             if info['processed']==1 or time.monotonic()-last_telemetry>=5:telemetry('after_first_predict' if info['processed']==1 else 'periodic_after_predict')
             for d in decisions:log.add(dict(type='decision',**d))
-            if classifier_mode=='low-rate':engine.expire_display(time.monotonic_ns())
+            if classifier_mode=='low-rate':
+                display_record=display_summary.observe(engine,time.monotonic_ns(),not args.no_display)
+                display_record.update(processed_index=info['processed']-1,epoch=engine.epoch,host_acquired_ns=stamp)
             if not args.no_display:
                 cv2.imshow('Patient monitoring development',paint(frame,people,selected,engine,rate,age));key=cv2.waitKey(1)&255
+                if classifier_mode=='low-rate':log.add(display_record)
                 if key in (27,ord('q')):break
                 if cv2.getWindowProperty('Patient monitoring development',cv2.WND_PROP_VISIBLE)<1:break
                 if key==ord('r'):engine.reset();log.add(dict(type='explicit_reset',host_ns=time.monotonic_ns(),epoch=engine.epoch))
@@ -262,6 +303,7 @@ def run(args):
                     selected,ds,_=engine.step(people,frame.shape[1],frame.shape[0],stamp,seed=detection)
                     log.add(dict(type='explicit_seed',host_acquired_ns=stamp,capture_sequence=seq,detection=detection,epoch=engine.epoch,status=selected['status'],tracking_diagnostics=engine.latest_step))
                     for d in ds:log.add(dict(type='decision',**d))
+            if classifier_mode=='low-rate' and args.no_display:log.add(display_record)
             if info['processed']%10==0:print('Processed',info['processed'],'rate',round(rate,2),'target',status,flush=True)
         if not info['processed']:raise RuntimeError('No camera frames processed within run duration')
         info.update(status='complete',acquisition_span_seconds=(last_stamp-first_stamp)/1e9,capture_rate_over_observed_span=None)
@@ -277,16 +319,23 @@ def run(args):
             span=(info['capture_last_host_ns']-info['capture_first_host_ns'])/1e9
             info['capture_rate_over_observed_span']=(info['captured']-1)/span if span>0 else None
             info['unprocessed_on_stop']=max(0,info['captured']-info['processed']-info['overwritten_pending']-info['dropped_incoming']-info['drained_older'])
+            if asynchronous:
+                from .live_async_ui import async_capture_accounting
+                info.update(async_capture_accounting(info))
         if log:telemetry('after_capture_cleanup')
         info.update(performance.summary())
+        if classifier_mode=='low-rate' and not asynchronous:info['display_summary']=display_summary.summary()
         info['continuity_note']='Feature/window gap is feature_window_max_gap_seconds; association is independently configured. Display low-rate expiry uses frozen max_latest_age_seconds.'
-        if engine:info.update(decision_counts={k:engine.decision_counts[k] for k in ('available','unavailable')},unavailable_decision_reasons=dict(engine.unavailable_reasons),skipped_grid_decisions=engine.skipped_decisions,explicit_seed_events=engine.seed_events,history_reset_events=engine.reset_events,reset_count_note='Includes reseed-triggered resets, excludes construction')
+        if engine and info.get('async_worker_stopped',True):info.update(decision_counts={k:engine.decision_counts[k] for k in ('available','unavailable')},unavailable_decision_reasons=dict(engine.unavailable_reasons),skipped_grid_decisions=engine.skipped_decisions,explicit_seed_events=engine.seed_events,history_reset_events=engine.reset_events,reset_count_note='Includes reseed-triggered resets, excludes construction')
         if not args.no_display:cv2.destroyAllWindows()
         if warning_filter:
             pose_logger.removeFilter(warning_filter);info['duplicate_half_warnings_suppressed']=warning_filter.suppressed
+        if asynchronous:
+            info['async_source_sha256']=sha(Path(__file__).with_name('live_async_ui.py'))
+            info['async_semantics']='One worker; one pending frame/result/control; epoch fenced; UI retains processed image only with matching pose. Per-update monotonic expiry; no TTL renewal.'
         if log:info['log_omitted_records']=log.omitted;info['log_bytes']=log.size;log.close()
         processing_elapsed=time.monotonic()-opened if capture else 0.
-        info.update(elapsed_seconds=time.monotonic()-started,target_status_counts=dict(statuses),processing_rate_per_second=info['processed']/processing_elapsed if processing_elapsed>0 else None,
+        info.update(elapsed_seconds=time.monotonic()-started,target_status_counts=info.get('target_status_counts',{}) if asynchronous else dict(statuses),processing_rate_per_second=info['processed']/processing_elapsed if processing_elapsed>0 else None,
             latest_sample_count=len(ages),latest_mean_frame_host_age_seconds=float(np.mean(ages)) if ages else None,latest_mean_pose_seconds=float(np.mean(poses)) if poses else None,latest_mean_classifier_aggregation_seconds=float(np.mean(class_times)) if class_times else None,
             timestamp_policy='monotonic_ns immediately after capture.read; host acquisition, not verified sensor exposure',latency_policy='host read-return to pre-display only; excludes sensor/backend/display refresh; NOT sensor-to-screen latency',buffer_policy='one pending frame; history<=256processed frames; strict~2s, low-rate retention from config window+2gap+stride; logs<=10MB; measurement rings256',source_sha256=sha(__file__))
         write(out/'summary.json',info)
@@ -294,7 +343,7 @@ def run(args):
 
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--classifier',choices=('strict','low-rate'),default='strict');p.add_argument('--experimental-association-gap',type=association_gap,help='Explicit experimental association lifetime >0.5 to 2 seconds; feature/window limits come from selected classifier');p.add_argument('--camera',type=int,required=True);p.add_argument('--pose-backend',choices=('pt','ncnn'),default='pt');p.add_argument('--imgsz',type=image_size,default=640);p.add_argument('--backend',choices=BACKENDS,default='auto');p.add_argument('--weights',required=True);p.add_argument('--model-dir',required=True);p.add_argument('--output-dir',required=True);p.add_argument('--duration',type=float);p.add_argument('--no-display',action='store_true',help='smoke test only; remains unseeded, no automatic person selection')
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--async-ui',action='store_true',help='Low-rate only: main-thread UI with single inference worker');p.add_argument('--classifier',choices=('strict','low-rate'),default='strict');p.add_argument('--experimental-association-gap',type=association_gap,help='Explicit experimental association lifetime >0.5 to 2 seconds; feature/window limits come from selected classifier');p.add_argument('--camera',type=int,required=True);p.add_argument('--pose-backend',choices=('pt','ncnn'),default='pt');p.add_argument('--imgsz',type=image_size,default=640);p.add_argument('--backend',choices=BACKENDS,default='auto');p.add_argument('--weights',required=True);p.add_argument('--model-dir',required=True);p.add_argument('--output-dir',required=True);p.add_argument('--duration',type=float);p.add_argument('--no-display',action='store_true',help='smoke test only; remains unseeded, no automatic person selection')
     a=p.parse_args()
     try:result=run(a)
     except FileExistsError as exc:p.exit(2,str(exc)+'\n')

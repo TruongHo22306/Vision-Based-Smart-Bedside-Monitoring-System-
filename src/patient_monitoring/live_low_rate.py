@@ -45,7 +45,7 @@ class LowRateEngine(LiveEngine):
     def reset(self):
         if self.epoch:self.reset_events+=1
         self.epoch+=1;self.association=None;self.audit=TimelineAudit();self.selected_history=deque(maxlen=256);self.history=[]
-        self.origin=None;self.last_host=None;self.next_end=Fraction(0);self.label=None;self.reason='explicit_seed_required';self.latest_step=None;self.display_support_host_ns=None
+        self.origin=None;self.last_host=None;self.next_end=Fraction(0);self.label=None;self.reason='explicit_seed_required';self.latest_step=None;self.display_support_host_ns=None;self.display_decision_host_ns=None;self.display_computed_host_ns=None
     def expire_display(self,host_now):
         if self.label is not None and (self.display_support_host_ns is None or (host_now-self.display_support_host_ns)/1e9>self.config['max_latest_age_seconds']):
             self.label=None;self.reason='display_support_expired'
@@ -73,7 +73,7 @@ class LowRateEngine(LiveEngine):
             value,reason=window(self.history,times,end,self.config)
             obs=[t for t in times[:-1] if end-Fraction(str(self.config['window_seconds']))<=t<end]
             gaps=[float(b-a) for a,b in zip(times,times[1:]) if a<end and b>end-Fraction(str(self.config['window_seconds']))]
-            d=dict(mode='low-rate',epoch=self.epoch,support_start=str(end-Fraction(str(self.config['window_seconds']))),support_end=str(end),decision_host_ns=self.origin+int(end*1000000000),computed_host_ns=time.monotonic_ns(),latest_arrived_host_ns=stamp,available=value is not None,reason=reason,label=None,observation_count=len(obs),observed_span=float(obs[-1]-obs[0]) if len(obs)>1 else None,latest_age=float(end-obs[-1]) if obs else None,max_support_gap=max(gaps) if gaps else None,model_sha256=PINS['model_state.pt'],config_sha256=PINS['config.json'])
+            d=dict(mode='low-rate',epoch=self.epoch,support_start=str(end-Fraction(str(self.config['window_seconds']))),support_end=str(end),decision_host_ns=self.origin+int(end*1000000000),compute_started_host_ns=time.monotonic_ns(),latest_arrived_host_ns=stamp,available=value is not None,reason=reason,label=None,observation_count=len(obs),observed_span=float(obs[-1]-obs[0]) if len(obs)>1 else None,latest_age=float(end-obs[-1]) if obs else None,max_support_gap=max(gaps) if gaps else None,model_sha256=PINS['model_state.pt'],config_sha256=PINS['config.json'])
             if value:
                 x=apply(np.asarray([value['vector']],dtype=float),self.prep)
                 with torch.no_grad():logits=self.model(torch.from_numpy(x))[0];scores=logits.softmax(0)
@@ -81,6 +81,9 @@ class LowRateEngine(LiveEngine):
                 d.update(label=CLASSES[int(scores.argmax())],logits=logits.tolist(),scores_uncalibrated=scores.tolist(),vector=value['vector'],channels=value['channels'])
                 self.display_support_host_ns=self.origin+int(obs[-1]*1000000000)
             else:self.display_support_host_ns=None
+            d['computed_host_ns']=time.monotonic_ns()
+            d['latest_support_host_ns']=self.display_support_host_ns
+            self.display_decision_host_ns=d['decision_host_ns'];self.display_computed_host_ns=d['computed_host_ns']
             self.label=d['label'];self.reason=reason;self.decision_counts['available' if value else 'unavailable']+=1
             if not value:self.unavailable_reasons[reason]+=1
             decisions.append(d)
