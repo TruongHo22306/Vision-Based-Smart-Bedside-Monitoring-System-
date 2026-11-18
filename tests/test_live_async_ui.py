@@ -8,6 +8,21 @@ def result(epoch=0,stamp=0,frame=1,label='standing',reason=None,support=0):
                 latest_support_host_ns=support,completed_host_ns=2000000000)
 
 class AsyncTests(unittest.TestCase):
+    def test_ui_wait_pending_result_and_publication_wakeup(self):
+        started=threading.Event();release=threading.Event()
+        def process(epoch,payload):started.set();release.wait(2);return result(epoch)
+        w=LatestWorker(process,lambda e,c:None)
+        try:
+            w.submit(1);self.assertTrue(started.wait(1))
+            timer=threading.Timer(.03,release.set);timer.start()
+            before=time.monotonic();self.assertTrue(w.wait_for_result(1.));self.assertLess(time.monotonic()-before,.5)
+            # An already published result must not invoke a blocking Condition.wait.
+            from unittest.mock import patch
+            with patch.object(w.cv,'wait',side_effect=AssertionError('pending result slept')):
+                self.assertTrue(w.wait_for_result(.02))
+            self.assertIsNotNone(w.take());self.assertFalse(w.wait_for_result(.001));timer.join()
+        finally:release.set();self.assertTrue(w.close())
+
     def test_single_worker_latest_queue_and_clean_shutdown(self):
         started=threading.Event();release=threading.Event();seen=[]
         def process(epoch,payload):

@@ -86,6 +86,11 @@ class LatestWorker:
 
 
 
+    def wait_for_result(self, timeout=.02):
+        """Bounded UI idle wait; pending publication/error/stop must never sleep."""
+        with self.cv:
+            return self.cv.wait_for(lambda: self.result is not None or self.error is not None or self.stopping, timeout=max(0.,timeout))
+
     def _run(self):
 
         try:
@@ -138,6 +143,7 @@ class LatestWorker:
 
                         result['published_host_ns']=time.monotonic_ns()
                         self.result = result
+                        self.cv.notify_all()
 
         except BaseException as exc:
 
@@ -222,7 +228,7 @@ class UIState:
 
         support=r.get('latest_support_host_ns') if r else None
 
-        deadline=None if support is None else support+self.ttl_ns
+        deadline=(r.get('support_deadline_host_ns') if r and 'support_deadline_host_ns' in r else None if support is None else support+self.ttl_ns)
 
         if label is not None and (deadline is None or now>deadline):
 
@@ -259,7 +265,7 @@ class UIState:
 
                     classifier_computed_host_ns=None if r is None else r.get('classifier_computed_host_ns'),
 
-                    latest_support_host_ns=support,support_age_seconds=None if support is None else (now-support)/1e9,
+                    support_deadline_host_ns=deadline,channel_support={} if r is None else r.get('channel_support',{}),latest_support_host_ns=support,support_age_seconds=None if support is None else (now-support)/1e9,
 
                     label=label,reason=reason,label_submitted_to_ui=submitted,non_display_reason=absent,image_age_seconds=image_age)
 
@@ -298,7 +304,7 @@ def run_loop(live,args,capture,pose,engine,predict_config,info,log,performance,t
 
     state=UIState(engine.config['max_latest_age_seconds']);display=live.DisplaySummary()
 
-    stats=dict(first_stamp=None,last_stamp=None);statuses=Counter();last_telemetry=0.
+    stats=dict(first_stamp=None,last_stamp=None);statuses=Counter();last_telemetry=0.;completion_counts=Counter();receipt_counts=Counter()
 
 
 
@@ -306,7 +312,12 @@ def run_loop(live,args,capture,pose,engine,predict_config,info,log,performance,t
 
         seq,stamp,frame=item
 
-        return dict(target_epoch=epoch,frame_id=seq,source_timestamp_ns=stamp,completed_host_ns=time.monotonic_ns(),
+        completed=time.monotonic_ns()
+        support=engine.display_support_host_ns
+        deadline=getattr(engine,'display_deadline_host_ns',None if support is None else support+round(engine.config['max_latest_age_seconds']*1e9))
+        eligible=engine.label is not None and deadline is not None and completed<=deadline
+        completion_counts['fresh' if eligible else 'expired' if engine.label is not None else 'unavailable']+=1
+        return dict(support_deadline_host_ns=deadline,channel_support=copy.deepcopy(getattr(engine,'channel_support',{})),fresh_at_completion=eligible,target_epoch=epoch,frame_id=seq,source_timestamp_ns=stamp,completed_host_ns=completed,
 
                     frame=frame,people=people,selected=copy.deepcopy(selected),label=engine.label,reason=engine.reason,
 
@@ -360,7 +371,7 @@ def run_loop(live,args,capture,pose,engine,predict_config,info,log,performance,t
 
         result=snapshot(epoch,item,people,selected,decisions,seconds,pose_seconds,predict_seconds)
 
-        log.add(dict(type='frame',mode='low-rate',target_epoch=epoch,epoch=engine.epoch,capture_sequence=seq,
+        log.add(dict(type='frame',mode=getattr(engine,'classifier_mode','low-rate'),fresh_at_completion=result['fresh_at_completion'],support_deadline_host_ns=result['support_deadline_host_ns'],channel_support=result['channel_support'],target_epoch=epoch,epoch=engine.epoch,capture_sequence=seq,
 
                      host_acquired_ns=stamp,completed_host_ns=result['completed_host_ns'],processed_index=info['processed']-1,
                      process_started_host_ns=before,capture_fetch_started_host_ns=worker.fetch_timing[0] if worker.fetch_timing else None,capture_fetch_completed_host_ns=worker.fetch_timing[1] if worker.fetch_timing else None,
@@ -424,6 +435,7 @@ def run_loop(live,args,capture,pose,engine,predict_config,info,log,performance,t
             now=time.monotonic_ns();update=state.tick(now,not args.no_display)
             assessment=None
             if received:
+                receipt_counts['fresh' if update['label'] is not None else 'expired' if update['reason']=='display_support_expired' else 'unavailable']+=1
                 proxy=SimpleNamespace(label=update['label'],reason=update['reason'],display_support_host_ns=result['latest_support_host_ns'],display_decision_host_ns=result['decision_host_ns'],display_computed_host_ns=result['classifier_computed_host_ns'],expire_display=lambda now:None)
                 assessment=display.observe(proxy,now,not args.no_display)
                 assessment.update(frame_id=result['frame_id'],target_epoch=result['target_epoch'],scope='first UI assessment of received result; repeated UI ticks logged separately')
@@ -436,7 +448,7 @@ def run_loop(live,args,capture,pose,engine,predict_config,info,log,performance,t
 
                 if r is not None:
 
-                    proxy=SimpleNamespace(classifier_mode='low-rate',label=update['label'],reason=update['reason'])
+                    proxy=SimpleNamespace(classifier_mode=getattr(engine,'classifier_mode','low-rate'),label=update['label'],reason=update['reason'])
 
                     image=live.paint(r['frame'],r['people'],r['selected'],proxy,info['processed']/max(.001,time.monotonic()-opened),update['image_age_seconds'])
 
@@ -461,7 +473,10 @@ def run_loop(live,args,capture,pose,engine,predict_config,info,log,performance,t
 
             if key in (27,ord('q')):break
 
-            if not args.no_display and window_created and live.cv2.getWindowProperty('Patient monitoring development',live.cv2.WND_PROP_VISIBLE)<1:break
+            property_started=time.monotonic_ns()
+            closed=not args.no_display and window_created and live.cv2.getWindowProperty('Patient monitoring development',live.cv2.WND_PROP_VISIBLE)<1
+            property_completed=time.monotonic_ns()
+            if closed:break
 
             if key==ord('r'):
 
@@ -477,7 +492,13 @@ def run_loop(live,args,capture,pose,engine,predict_config,info,log,performance,t
 
                 else:log.add(dict(type='seed_rejected',reason='detection_not_on_displayed_frame',frame_id=r['frame_id'],detection=index))
 
-            time.sleep(.02)
+            wait_started=time.monotonic_ns()
+            budget=.02
+            if state.previous and state.previous[1] and state.previous[2] is not None:
+                budget=min(budget,max(0.,(state.previous[2]-wait_started)/1e9))
+            awakened=worker.wait_for_result(budget)
+            wait_completed=time.monotonic_ns()
+            log.add(dict(type='ui_tail_timing',assessed_host_ns=now,window_property_started_host_ns=property_started,window_property_completed_host_ns=property_completed,idle_wait_started_host_ns=wait_started,idle_wait_completed_host_ns=wait_completed,idle_wait_budget_seconds=budget,result_or_error_ready=awakened))
 
     finally:
 
@@ -487,7 +508,7 @@ def run_loop(live,args,capture,pose,engine,predict_config,info,log,performance,t
 
         clean=worker.close()
 
-        info.update(async_worker_stopped=clean,async_queue_counts=dict(worker.counts),async_ui=state.summary(ui_closed_at),display_summary=display.summary(),target_status_counts=dict(statuses))
+        info.update(result_freshness_at_completion=dict(completion_counts),result_freshness_at_first_ui_assessment=dict(receipt_counts),async_worker_stopped=clean,async_queue_counts=dict(worker.counts),async_ui=state.summary(ui_closed_at),display_summary=display.summary(),target_status_counts=dict(statuses))
 
         if not clean:raise RuntimeError('Inference worker did not stop within 10s; run incomplete; external process timeout required')
 

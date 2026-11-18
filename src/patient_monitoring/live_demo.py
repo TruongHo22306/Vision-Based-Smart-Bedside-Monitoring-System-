@@ -178,7 +178,7 @@ def paint(frame,people,selected,engine,rate,age):
         for a,b in EDGES:
             if j[a]['passes_quality_gate'] and j[b]['passes_quality_gate']:cv2.line(image,(int(j[a]['x']),int(j[a]['y'])),(int(j[b]['x']),int(j[b]['y'])),(0,255,0),2)
     footer=np.zeros((150,image.shape[1],3),np.uint8)
-    for i,text in enumerate([('LOW-RATE EXPERIMENTAL | NOT GROUND TRUTH' if getattr(engine,'classifier_mode','strict')=='low-rate' else 'EXPERIMENTAL DEVELOPMENT | NOT GROUND TRUTH'),f"{engine.label or 'UNAVAILABLE'} | {engine.reason or 'available window'}",f'Processing {rate:.2f}/s | host frame age {age:.3f}s', '0-9: seed displayed D | r: reset | q/ESC: stop','No calibrated confidence; no sensor latency estimate']):
+    for i,text in enumerate([('ACQUISITION-V002 EXPERIMENTAL | NOT GROUND TRUTH' if getattr(engine,'classifier_mode','strict')=='acquisition-v002' else 'LOW-RATE EXPERIMENTAL | NOT GROUND TRUTH' if getattr(engine,'classifier_mode','strict')=='low-rate' else 'EXPERIMENTAL DEVELOPMENT | NOT GROUND TRUTH'),f"{engine.label or 'UNAVAILABLE'} | {engine.reason or 'available window'}",f'Processing {rate:.2f}/s | host frame age {age:.3f}s', '0-9: seed displayed D | r: reset | q/ESC: stop','No calibrated confidence; no sensor latency estimate']):
         cv2.putText(footer,text,(6,24+i*28),cv2.FONT_HERSHEY_SIMPLEX,min(.55,(image.shape[1]-12)/(max(len(text),1)*11)),(255,255,255),1)
     return np.vstack([image,footer])
 
@@ -186,9 +186,10 @@ def paint(frame,people,selected,engine,rate,age):
 def run(args):
     if args.camera<0 or (args.duration is not None and (not math.isfinite(args.duration) or args.duration<=0)):raise ValueError('Invalid camera/duration')
     classifier_mode=getattr(args,'classifier','strict')
-    if classifier_mode not in ('strict','low-rate'):raise ValueError('Invalid classifier mode')
+    if classifier_mode not in ('strict','low-rate','acquisition-v002'):raise ValueError('Invalid classifier mode')
     asynchronous=getattr(args,'async_ui',False)
-    if asynchronous and classifier_mode!='low-rate':raise ValueError('--async-ui requires --classifier low-rate; strict is unchanged')
+    if classifier_mode=='acquisition-v002' and (not asynchronous or getattr(args,'pose_backend','pt')!='ncnn' or getattr(args,'imgsz',640)!=320):raise ValueError('acquisition-v002 requires --async-ui --pose-backend ncnn --imgsz 320')
+    if asynchronous and classifier_mode not in ('low-rate','acquisition-v002'):raise ValueError('--async-ui requires --classifier low-rate; strict is unchanged')
     experimental_gap=getattr(args,'experimental_association_gap',None)
     if experimental_gap is not None:experimental_gap=association_gap(experimental_gap)
     pose_backend=getattr(args,'pose_backend','pt')
@@ -219,6 +220,10 @@ def run(args):
             frozen=verify_live_manifest(modeldir);model,prep,schema=load_bundle(modeldir)
             engine=LiveEngine(model,prep,schema,experimental_gap)
             info['classifier_artifact_hashes']={n:sha(modeldir/n) for n in ('model_state.pt','preprocessing.json','feature_schema.json','config.json')}
+        elif classifier_mode=='acquisition-v002':
+            from .live_acquisition import load_acquisition,verify_bundle,AcquisitionEngine
+            model,prep,schema,config=load_acquisition(modeldir);engine=AcquisitionEngine(model,prep,schema,config,experimental_gap)
+            info.update(classifier_artifact_hashes=verify_bundle(modeldir),classifier_config=config,feature_window_max_gap_seconds=config['max_gap_seconds'])
         else:
             from .live_low_rate import load_low_rate,verify_bundle,LowRateEngine
             model,prep,schema,config=load_low_rate(modeldir);engine=LowRateEngine(model,prep,schema,config,experimental_gap)
@@ -343,7 +348,7 @@ def run(args):
 
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--async-ui',action='store_true',help='Low-rate only: main-thread UI with single inference worker');p.add_argument('--classifier',choices=('strict','low-rate'),default='strict');p.add_argument('--experimental-association-gap',type=association_gap,help='Explicit experimental association lifetime >0.5 to 2 seconds; feature/window limits come from selected classifier');p.add_argument('--camera',type=int,required=True);p.add_argument('--pose-backend',choices=('pt','ncnn'),default='pt');p.add_argument('--imgsz',type=image_size,default=640);p.add_argument('--backend',choices=BACKENDS,default='auto');p.add_argument('--weights',required=True);p.add_argument('--model-dir',required=True);p.add_argument('--output-dir',required=True);p.add_argument('--duration',type=float);p.add_argument('--no-display',action='store_true',help='smoke test only; remains unseeded, no automatic person selection')
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--async-ui',action='store_true',help='Low-rate only: main-thread UI with single inference worker');p.add_argument('--classifier',choices=('strict','low-rate','acquisition-v002'),default='strict');p.add_argument('--experimental-association-gap',type=association_gap,help='Explicit experimental association lifetime >0.5 to 2 seconds; feature/window limits come from selected classifier');p.add_argument('--camera',type=int,required=True);p.add_argument('--pose-backend',choices=('pt','ncnn'),default='pt');p.add_argument('--imgsz',type=image_size,default=640);p.add_argument('--backend',choices=BACKENDS,default='auto');p.add_argument('--weights',required=True);p.add_argument('--model-dir',required=True);p.add_argument('--output-dir',required=True);p.add_argument('--duration',type=float);p.add_argument('--no-display',action='store_true',help='smoke test only; remains unseeded, no automatic person selection')
     a=p.parse_args()
     try:result=run(a)
     except FileExistsError as exc:p.exit(2,str(exc)+'\n')
